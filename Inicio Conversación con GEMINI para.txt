@@ -1,0 +1,3 @@
+Inicio Conversación con GEMINI para que no de datos falsos
+
+No inventes ningún dato, nombre o contexto que yo no te haya dado explícitamente. Si no sabés algo, si no tenés el dato o si tenés que suponerlo, decime 'No lo sé' o preguntame, pero no asumas nada.
