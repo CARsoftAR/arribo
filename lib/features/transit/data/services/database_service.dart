@@ -3,6 +3,7 @@ import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:http/http.dart' as http;
+import 'package:google_maps_flutter/google_maps_flutter.dart';
 
 class FavoriteStop {
   final String id;
@@ -23,8 +24,8 @@ class DatabaseService {
   Future<Database> get database async {
     if (_database != null) return _database!;
     _database = await _initDatabase();
-    // Trigger background sync of official GTFS shapes
-    syncOfficialShapes();
+    // Ensure shapes are loaded from local assets if needed
+    ensureShapesLoaded();
     return _database!;
   }
 
@@ -63,7 +64,7 @@ class DatabaseService {
     String path = join(await getDatabasesPath(), 'arribo_favorites.db');
     return await openDatabase(
       path,
-      version: 12,
+      version: 14,
       onCreate: (db, version) async {
         await db.execute('CREATE TABLE favorites(id TEXT PRIMARY KEY, name TEXT)');
         await _createOfflineTables(db);
@@ -163,11 +164,83 @@ class DatabaseService {
           await _seedRoutesTable(db);
           await _seedStopsTable(db);
         }
+        if (oldVersion < 13) {
+          await db.execute('CREATE INDEX IF NOT EXISTS idx_shapes_shape_sequence ON shapes(shape_id, shape_pt_sequence)');
+        }
+        if (oldVersion < 14) {
+          // Force drop shapes table and seed with official shapes_filtrados.txt from GTFS AMBA
+          await db.execute('DROP TABLE IF EXISTS shapes');
+          await db.execute('CREATE TABLE IF NOT EXISTS shapes (shape_id TEXT, shape_pt_lat REAL, shape_pt_lon REAL, shape_pt_sequence INTEGER, PRIMARY KEY (shape_id, shape_pt_sequence))');
+          await db.execute('CREATE INDEX IF NOT EXISTS idx_shapes_shape_sequence ON shapes(shape_id, shape_pt_sequence)');
+          await _seedShapesTable(db);
+        }
       },
     );
   }
 
   Future<void> _seedShapesTable(Database db) async {
+    try {
+      final csvContent = await rootBundle.loadString('assets/data/shapes_filtrados.txt');
+      final lines = csvContent.split('\n');
+      if (lines.isNotEmpty) {
+        final header = lines[0].toLowerCase();
+        final partsHeader = header.split(',');
+        
+        int colShapeId = partsHeader.indexOf('shape_id');
+        int colLat = partsHeader.indexOf('shape_pt_lat');
+        int colLon = partsHeader.indexOf('shape_pt_lon');
+        int colSeq = partsHeader.indexOf('shape_pt_sequence');
+
+        if (colShapeId == -1) colShapeId = 0;
+        if (colLat == -1) colLat = 2;
+        if (colLon == -1) colLon = 3;
+        if (colSeq == -1) colSeq = 4;
+
+        await db.transaction((txn) async {
+          final batch = txn.batch();
+          int count = 0;
+          for (int i = 1; i < lines.length; i++) {
+            final line = lines[i].trim();
+            if (line.isEmpty) continue;
+
+            final parts = line.split(',');
+            if (parts.length <= colShapeId || 
+                parts.length <= colLat || 
+                parts.length <= colLon || 
+                parts.length <= colSeq) continue;
+
+            try {
+              final shapeId = parts[colShapeId].trim();
+              final lat = double.parse(parts[colLat].trim());
+              final lon = double.parse(parts[colLon].trim());
+              final sequence = int.parse(parts[colSeq].trim());
+
+              batch.insert('shapes', {
+                'shape_id': shapeId,
+                'shape_pt_lat': lat,
+                'shape_pt_lon': lon,
+                'shape_pt_sequence': sequence,
+              }, conflictAlgorithm: ConflictAlgorithm.replace);
+
+              count++;
+              if (count % 500 == 0) {
+                await batch.commit(noResult: true);
+              }
+            } catch (_) {
+              // skip malformed row
+            }
+          }
+          if (count % 500 != 0) {
+            await batch.commit(noResult: true);
+          }
+        });
+        print('[Database] Seeded high-precision official shapes from shapes_filtrados.txt successfully!');
+        return;
+      }
+    } catch (e) {
+      print('[Database] Failed to seed official shapes: $e. Using local detailed JSONs as fallback.');
+    }
+
     // 1. Seed Shapes for 159 (High-resolution curves)
     final Map<String, String> shapeAssetMap159 = {
       '159_r1_shape': 'assets/data/route_159_r1_detailed.json',
@@ -339,6 +412,7 @@ class DatabaseService {
     await db.execute('CREATE TABLE IF NOT EXISTS stops (id TEXT PRIMARY KEY, line TEXT, name TEXT, latitude REAL, longitude REAL, sequence INTEGER)');
     await db.execute('CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, line TEXT, departure_time TEXT, direction TEXT, trip_duration_minutes INTEGER)');
     await db.execute('CREATE TABLE IF NOT EXISTS shapes (shape_id TEXT, shape_pt_lat REAL, shape_pt_lon REAL, shape_pt_sequence INTEGER, PRIMARY KEY (shape_id, shape_pt_sequence))');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_shapes_shape_sequence ON shapes(shape_id, shape_pt_sequence)');
     
     await _seedShapesTable(db);
     await _seedRoutesTable(db);
@@ -491,5 +565,153 @@ class DatabaseService {
       whereArgs: [shapeId],
       orderBy: 'shape_pt_sequence ASC',
     );
+  }
+
+  Future<List<LatLng>> getRouteShape(String shapeId) async {
+    final db = await database;
+    
+    // Map internal app shapeId to official high-precision GTFS shapeId from shapes_filtrados.txt
+    String targetId = shapeId;
+    if (shapeId == '159_r1_shape') {
+      targetId = '1793'; // 159D Cruce Varela Ida
+    } else if (shapeId == '159_r2_shape') {
+      targetId = '1795'; // 159E Villa España via Autopista/Acceso Sudeste (official high-precision alignment)
+    } else if (shapeId == '159_azul_shape') {
+      targetId = '1809'; // 159K Alpargatas via Autopista
+    } else if (shapeId == '159_roja_shape') {
+      targetId = '1799'; // 159H Expreso/Roja via Autopista
+    } else if (shapeId == '98_r3_shape') {
+      targetId = '691';  // 98C Villa España
+    } else if (shapeId == '98_r5_shape') {
+      targetId = '695';  // 98E Once - Av Mitre
+    }
+
+    final results = await db.query(
+      'shapes',
+      where: 'shape_id = ?',
+      whereArgs: [targetId],
+      orderBy: 'shape_pt_sequence ASC',
+    );
+
+    if (results.isNotEmpty) {
+      return results.map((row) => LatLng(
+        row['shape_pt_lat'] as double,
+        row['shape_pt_lon'] as double,
+      )).toList();
+    }
+
+    // Fallback to query with original shapeId if not found in GTFS official mapping
+    final fallbackResults = await db.query(
+      'shapes',
+      where: 'shape_id = ?',
+      whereArgs: [shapeId],
+      orderBy: 'shape_pt_sequence ASC',
+    );
+
+    return fallbackResults.map((row) => LatLng(
+      row['shape_pt_lat'] as double,
+      row['shape_pt_lon'] as double,
+    )).toList();
+  }
+
+  Future<int> ingestGtfsShapesFromCsv(String csvContent) async {
+    final db = await database;
+    final lines = csvContent.split('\n');
+    if (lines.isEmpty) return 0;
+
+    int insertedCount = 0;
+
+    await db.transaction((txn) async {
+      final batch = txn.batch();
+
+      for (int i = 1; i < lines.length; i++) {
+        final line = lines[i].trim();
+        if (line.isEmpty) continue;
+
+        final parts = line.split(',');
+        if (parts.length < 5) continue;
+
+        try {
+          final shapeId = parts[0].trim();
+          final lat = double.parse(parts[2].trim());
+          final lon = double.parse(parts[3].trim());
+          final sequence = int.parse(parts[4].trim());
+
+          batch.insert('shapes', {
+            'shape_id': shapeId,
+            'shape_pt_lat': lat,
+            'shape_pt_lon': lon,
+            'shape_pt_sequence': sequence,
+          }, conflictAlgorithm: ConflictAlgorithm.replace);
+
+          insertedCount++;
+          if (insertedCount % 1000 == 0) {
+            await batch.commit(noResult: true);
+          }
+        } catch (e) {
+          continue;
+        }
+      }
+
+      await batch.commit(noResult: true);
+    });
+
+    print('[Database] GTFS shapes ingestion complete: $insertedCount points inserted');
+    return insertedCount;
+  }
+
+  Future<int> loadShapesFromAssets() async {
+    try {
+      final csvContent = await rootBundle.loadString('assets/data/shapes_filtrados.txt');
+      return await ingestGtfsShapesFromCsv(csvContent);
+    } catch (e) {
+      print('[Database] Error loading shapes from assets: $e');
+      return 0;
+    }
+  }
+
+  Future<void> ensureShapesLoaded() async {
+    final db = await database;
+    final count = Sqflite.firstIntValue(
+      await db.rawQuery('SELECT COUNT(*) FROM shapes')
+    ) ?? 0;
+    
+    if (count < 1000) {
+      print('[Database] Shapes table almost empty ($count points), loading from assets...');
+      await loadShapesFromAssets();
+    }
+  }
+
+  Future<int> ingestGtfsShapesFromJson(List<dynamic> shapesList) async {
+    final db = await database;
+    int insertedCount = 0;
+
+    await db.transaction((txn) async {
+      final batch = txn.batch();
+
+      for (var shape in shapesList) {
+        final shapeId = shape['shape_id'] as String;
+        final lat = (shape['shape_pt_lat'] as num).toDouble();
+        final lon = (shape['shape_pt_lon'] as num).toDouble();
+        final seq = shape['shape_pt_sequence'] as int;
+
+        batch.insert('shapes', {
+          'shape_id': shapeId,
+          'shape_pt_lat': lat,
+          'shape_pt_lon': lon,
+          'shape_pt_sequence': seq,
+        }, conflictAlgorithm: ConflictAlgorithm.replace);
+
+        insertedCount++;
+        if (insertedCount % 500 == 0) {
+          await batch.commit(noResult: true);
+        }
+      }
+
+      await batch.commit(noResult: true);
+    });
+
+    print('[Database] JSON shapes ingestion complete: $insertedCount points inserted');
+    return insertedCount;
   }
 }

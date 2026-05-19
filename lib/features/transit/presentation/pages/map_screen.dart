@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:http/http.dart' as http;
+
 import 'package:arribo/core/config/debug_config.dart';
 import 'package:arribo/core/constants/map_style.dart';
 import 'package:arribo/features/ui_components/glass_card.dart';
@@ -461,82 +461,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     });
   }
 
-  Future<List<LatLng>> _fetchOSRMRoute(TransitVehicle vehicle) async {
-    try {
-      final String shapeId = vehicle.shapeId ?? '';
-      
-      // 1. Attempt to fetch official stops for the branch to get dynamic street-aligned route snapping
-      if (shapeId.isNotEmpty) {
-        final List<Map<String, dynamic>> dbStops = await _databaseService.getStopsForShape(shapeId);
-        if (dbStops.isNotEmpty) {
-          final sortedStops = List<Map<String, dynamic>>.from(dbStops);
-          sortedStops.sort((a, b) => (a['sequence'] as int).compareTo(b['sequence'] as int));
-
-          final String coords = sortedStops.map((stop) {
-            final double lat = stop['latitude'] as double;
-            final double lon = stop['longitude'] as double;
-            return '$lon,$lat';
-          }).join(';');
-
-          final url = 'https://router.project-osrm.org/route/v1/driving/$coords?overview=full&geometries=geojson';
-          final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 8));
-          if (response.statusCode == 200) {
-            final data = jsonDecode(response.body);
-            if (data['routes'] != null && data['routes'].isNotEmpty) {
-              final geometry = data['routes'][0]['geometry'];
-              final List<dynamic> coordinates = geometry['coordinates'];
-              return coordinates.map((coord) {
-                return LatLng(coord[1] as double, coord[0] as double);
-              }).toList();
-            }
-          }
-        }
-      }
-
-      // 2. Fallback to start and end terminal coordinates
-      LatLng start;
-      LatLng end;
-
-      if (shapeId.contains('azul') || shapeId.contains('roja')) {
-        start = const LatLng(-34.6282, -58.3798); // Constitución/CABA
-        end = const LatLng(-34.8582, -58.1738);   // Alpargatas
-      } else if (shapeId.contains('r2')) {
-        start = const LatLng(-34.6282, -58.3798); // Constitución/CABA
-        end = const LatLng(-34.7675, -58.2015);   // Villa España
-      } else if (shapeId.contains('r1')) {
-        start = const LatLng(-34.6282, -58.3798); // Constitución/CABA
-        end = const LatLng(-34.7965, -58.2755);   // Cruce Varela
-      } else if (shapeId.contains('r3')) {
-        start = const LatLng(-34.6097, -58.4068); // Once
-        end = const LatLng(-34.7628, -58.2115);   // Lisandro de la Torre
-      } else if (shapeId.contains('r5')) {
-        start = const LatLng(-34.6097, -58.4068); // Once
-        end = const LatLng(-34.7650, -58.2160);   // Av. Mitre
-      } else {
-        return [];
-      }
-
-      final url = 'https://router.project-osrm.org/route/v1/driving/'
-          '${start.longitude},${start.latitude};${end.longitude},${end.latitude}'
-          '?overview=full&geometries=geojson';
-
-      final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 5));
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        if (data['routes'] != null && data['routes'].isNotEmpty) {
-          final geometry = data['routes'][0]['geometry'];
-          final List<dynamic> coordinates = geometry['coordinates'];
-          return coordinates.map((coord) {
-            return LatLng(coord[1] as double, coord[0] as double);
-          }).toList();
-        }
-      }
-    } catch (e) {
-      debugPrint('[MapScreen] Dynamic OSRM route snapping failed: $e');
-    }
-    return [];
-  }
-
   Future<List<LatLng>> _loadLocalJsonFallback(String line, String shapeId) async {
     try {
       String assetPath = 'assets/data/route_159.json';
@@ -600,35 +524,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       final Color color = _getLineInstitutionalColor(line);
 
       for (final shapeId in targetShapeIds) {
-        // 1. Query SQLite
-        List<Map<String, dynamic>> pointsData = List.from(
-          await _databaseService.getShapesForId(shapeId)
-        );
+        // 1. Query SQLite with optimized getRouteShape method
+        List<LatLng> points = await _databaseService.getRouteShape(shapeId);
 
-        List<LatLng> points = [];
-
-        if (pointsData.isNotEmpty) {
-          pointsData.sort((a, b) => (a['shape_pt_sequence'] as int).compareTo(b['shape_pt_sequence'] as int));
-          points = pointsData.map((pt) {
-            return LatLng(pt['shape_pt_lat'] as double, pt['shape_pt_lon'] as double);
-          }).toList();
-        }
-
-        // 2. Fetch OSRM
-        if (points.isEmpty) {
-          final dummyVehicle = TransitVehicle(
-            id: 'dummy_$shapeId',
-            line: line,
-            position: const LatLng(0, 0),
-            bearing: 0,
-            lastUpdate: DateTime.now(),
-            destination: '',
-            shapeId: shapeId,
-          );
-          points = await _fetchOSRMRoute(dummyVehicle);
-        }
-
-        // 3. Fallback local JSON
+        // 2. Fallback to local JSON (GTFS shapes from assets)
         if (points.isEmpty) {
           points = await _loadLocalJsonFallback(line, shapeId);
         }
@@ -685,30 +584,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       final Set<Polyline> newPolylines = {};
       final Color color = _getLineColor(vehicle.line);
 
-      // 1. Query SQLite
-      List<Map<String, dynamic>> pointsData = List.from(
-        await _databaseService.getShapesForId(shapeId)
-      );
-
-      List<LatLng> points = [];
-
-      if (pointsData.isNotEmpty) {
-        pointsData.sort((a, b) => (a['shape_pt_sequence'] as int).compareTo(b['shape_pt_sequence'] as int));
-        points = pointsData.map((pt) {
-          return LatLng(pt['shape_pt_lat'] as double, pt['shape_pt_lon'] as double);
-        }).toList();
+      // 1. Query SQLite with optimized getRouteShape method
+      List<LatLng> points = await _databaseService.getRouteShape(shapeId);
+      if (points.isNotEmpty) {
         debugPrint('[MapScreen] Loaded shape $shapeId from SQLite with ${points.length} points.');
       }
 
-      // 2. Fetch OSRM
+      // 2. Fallback to local JSON (GTFS shapes from assets)
       if (points.isEmpty) {
-        debugPrint('[MapScreen] SQLite empty for $shapeId, attempting OSRM Street Snapping...');
-        points = await _fetchOSRMRoute(vehicle);
-      }
-
-      // 3. Fallback Plan B
-      if (points.isEmpty) {
-        debugPrint('[MapScreen] OSRM & SQLite failed, loading local JSON fallback...');
+        debugPrint('[MapScreen] SQLite empty, loading local JSON GTFS fallback...');
         points = await _loadLocalJsonFallback(vehicle.line, shapeId);
       }
 
